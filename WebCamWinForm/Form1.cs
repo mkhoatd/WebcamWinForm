@@ -2,12 +2,15 @@
 using BasicAudio;
 using DirectShowLib;
 using FFMpegCore;
+using IronQr;
 using OpenCvSharp;
 using OpenCvSharp.Extensions;
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -16,11 +19,10 @@ namespace WebCamWinForm2020
     public partial class Form1 : Form
     {
         bool isCameraRunning = false;
-        bool isMicrophoneJustStarted = false;
         VideoCapture capture;
-        VideoWriter outputVideo;
         Recording audioRecorder;
-
+        private SemaphoreSlim semaphore = new SemaphoreSlim(3); // Limiting to 3 concurrent tasks
+        private QrReader qrReader = new QrReader();
         Mat frame;
         Bitmap imageAlternate;
         Bitmap image;
@@ -44,7 +46,7 @@ namespace WebCamWinForm2020
 
         private async void btnRecord_Click(object sender, EventArgs e)
         {
-            if (ddlVideoDevices.SelectedIndex < 0) 
+            if (ddlVideoDevices.SelectedIndex < 0)
             {
                 MessageBox.Show("Please choose a video device as the Video Source.", "Video Source Not Defined", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
@@ -55,8 +57,6 @@ namespace WebCamWinForm2020
                 lblStatus.Text = "Starting recording...";
 
                 StartCamera();
-                StartMicrophone();
-
                 recordingTimer.Enabled = true;
                 recordingTimer.Start();
 
@@ -65,15 +65,13 @@ namespace WebCamWinForm2020
             else
             {
                 StopCamera();
-                StopMicrophone();
-
                 lblStatus.Text = "Recording ended.";
 
                 await OutputRecordingAsync();
             }
         }
 
-        private void StartCamera() 
+        private void StartCamera()
         {
             DisposeCameraResources();
 
@@ -85,10 +83,9 @@ namespace WebCamWinForm2020
             capture = new VideoCapture(deviceIndex);
             capture.Open(deviceIndex);
 
-            outputVideo = new VideoWriter("video.mp4", FourCC.AVC, 29, new OpenCvSharp.Size(640, 480));
         }
 
-        private void StopCamera() 
+        private void StopCamera()
         {
             isCameraRunning = false;
 
@@ -100,59 +97,16 @@ namespace WebCamWinForm2020
             DisposeCaptureResources();
         }
 
-        private void StartMicrophone() 
-        {
-            audioRecorder = new Recording();
-            audioRecorder.Filename = "sound.wav";
-            isMicrophoneJustStarted = true;
-        }
-
         private void StopMicrophone()
         {
             audioRecorder.StopRecording();
         }
 
-        private async Task OutputRecordingAsync() 
+        private static async Task OutputRecordingAsync()
         {
-            string outputPath = $"output_{DateTime.Now.ToString("yyyy_MM_dd_HH_mm_ss")}.mp4";
-
-            try
-            {
-                FFMpeg.ReplaceAudio("video.mp4", "sound.wav", outputPath, true);
-
-                lblStatus.Text = $"Recording saved to local disk with the file name {outputPath}.";
-
-                string azureStorageConnectionString = txtAzureStorageConnectionString.Text;
-                if (!string.IsNullOrWhiteSpace(azureStorageConnectionString))
-                {
-                    try
-                    {
-                        BlobServiceClient blobServiceClient = new BlobServiceClient(azureStorageConnectionString);
-                        BlobContainerClient containerClient = blobServiceClient.GetBlobContainerClient("webcam-videos");
-                        BlobClient blobClient = containerClient.GetBlobClient(outputPath);
-
-                        using FileStream uploadFileStream = File.OpenRead(outputPath);
-                        await blobClient.UploadAsync(uploadFileStream, true);
-                        uploadFileStream.Close();
-
-                        lblStatus.Text = $"Recording saved to both local disk and Azure Blob Storage with the file name {outputPath}.";
-                    }
-                    catch (Exception ex)
-                    {
-                        lblStatus.Text = $"Recording saved to both local disk with the file name {outputPath} but cannot be saved on Azure Blob Storage.";
-                        MessageBox.Show(ex.Message, "Error on Saving to Azure Blob Storage", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    }
-                }
-            }
-            catch (Exception ex) 
-            {
-                lblStatus.Text = "Recording cannot be saved.";
-
-                MessageBox.Show($"Recording cannot be saved because {ex.Message}", "Error on Recording Saving", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
         }
 
-        private void DisposeCameraResources() 
+        private void DisposeCameraResources()
         {
             if (frame != null)
             {
@@ -170,18 +124,47 @@ namespace WebCamWinForm2020
             }
         }
 
-        private void DisposeCaptureResources() 
+        private void DisposeCaptureResources()
         {
             if (capture != null)
             {
                 capture.Release();
                 capture.Dispose();
             }
+        }
 
-            if (outputVideo != null)
+        private async Task readQRAsync(Bitmap im)
+        {
+            if (!await semaphore.WaitAsync(TimeSpan.Zero)) // Attempt to acquire semaphore without waiting
             {
-                outputVideo.Release();
-                outputVideo.Dispose();
+                textBox1.Text = "Semaphore is full, skipping frame...";
+                return;
+            }
+            try
+            {
+                IEnumerable<QrResult> asyncResults = await qrReader.ReadAsync(new QrImageInput(im)); // Async version
+                textBox1.Text = "Reading QR Code...";
+                foreach (var res in asyncResults)
+                {
+                    textBox2.Text = res.Value;
+                }
+            }
+            finally
+            {
+                semaphore.Release(); // Release semaphore
+            }
+        }
+
+        private void readQR(Bitmap im)
+        {
+            IEnumerable<QrResult> asyncResults = qrReader.Read(new QrImageInput(im)); // Async version
+            textBox1.Text = "Reading QR Code...";
+            foreach (var res in asyncResults)
+            {
+                if (!String.IsNullOrEmpty(res.Value))
+                {
+                    textBox2.Text = res.Value;
+                }
             }
         }
 
@@ -205,13 +188,12 @@ namespace WebCamWinForm2020
                             isUsingImageAlternate = false;
                             image = BitmapConverter.ToBitmap(frame);
                         }
-
-                        pictureBox1.Image = isUsingImageAlternate ? imageAlternate : image;
-
-                        outputVideo.Write(frame);
+                        var im = isUsingImageAlternate ? imageAlternate : image;
+                        pictureBox1.Image = im;
+                        readQRAsync(im);
                     }
                 }
-                catch (Exception) 
+                catch (Exception)
                 {
                     pictureBox1.Image = null;
                 }
@@ -233,13 +215,32 @@ namespace WebCamWinForm2020
                         imageAlternate = null;
                     }
                 }
-
-                if (isMicrophoneJustStarted)
-                {
-                    audioRecorder.StartRecording();
-                    isMicrophoneJustStarted = false;
-                }
             }
+        }
+
+        private void ddlVideoDevices_SelectedIndexChanged(object sender, EventArgs e)
+        {
+
+        }
+
+        private void lblStatus_Click(object sender, EventArgs e)
+        {
+
+        }
+
+        private void textBox1_TextChanged(object sender, EventArgs e)
+        {
+
+        }
+
+        private void pictureBox1_Click(object sender, EventArgs e)
+        {
+
+        }
+
+        private void textBox2_TextChanged(object sender, EventArgs e)
+        {
+
         }
     }
 }
